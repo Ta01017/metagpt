@@ -9,6 +9,7 @@ Evaluate a Stage12 model using a learned forward surrogate (MSE/MAE/Corr).
 import argparse
 import numpy as np
 import torch
+import pickle
 
 from models.forward_surrogate import build_surrogate_from_ckpt
 
@@ -22,6 +23,7 @@ if OPTOGPT_ROOT not in sys.path:
     sys.path.append(OPTOGPT_ROOT)
 
 from core.models.transformer import make_model_I, subsequent_mask  # noqa: E402
+from structure_lang.tokenizer import StructureTokenizer, StructureTokenizerExtended  # noqa: E402
 
 
 def load_stage12(ckpt_path, device):
@@ -89,21 +91,79 @@ def generate(model, spec, word_dict, max_len, device, top_k=30, top_p=0.95, gree
     return seq
 
 
+def _decode_pred(ids, index_dict):
+    return [index_dict.get(i, f"UNKID_{i}") for i in ids]
+
+
+def _trim_at_eos(tokens, eos_token="EOS"):
+    if eos_token in tokens:
+        end = tokens.index(eos_token) + 1
+        return tokens[:end]
+    return tokens
+
+
+def _extract_first(prefix, tokens):
+    for t in tokens:
+        if isinstance(t, str) and t.startswith(prefix):
+            return t
+    return None
+
+
 @torch.no_grad()
-def eval_model(model, word_dict, spec_arr, surrogate, pad_id, n, max_len, greedy=False, n_candidates=1):
+def eval_model(
+    model,
+    word_dict,
+    index_dict,
+    spec_arr,
+    surrogate,
+    pad_id,
+    n,
+    max_len,
+    greedy=False,
+    n_candidates=1,
+    struct_list=None,
+    tokenizer_mode="auto",
+    show_samples=0,
+):
     mse_list, mae_list, corr_list = [], [], []
     rng = np.random.default_rng(0)
     idxs = rng.choice(len(spec_arr), size=min(n, len(spec_arr)), replace=False)
+
+    # optional diagnostics
+    use_diag = struct_list is not None
+    if use_diag:
+        if tokenizer_mode == "extended":
+            tk = StructureTokenizerExtended()
+        elif tokenizer_mode == "base":
+            tk = StructureTokenizer()
+        else:
+            base = StructureTokenizer()
+            max_id = max(max(s) for s in struct_list) if len(struct_list) > 0 else 0
+            tk = StructureTokenizerExtended() if max_id >= base.vocab_size else base
+
+        diag = {
+            "pred_len": [],
+            "gt_len": [],
+            "eos_hit": 0,
+            "pos_match": [],
+            "px_match": 0,
+            "py_match": 0,
+            "h_match": 0,
+            "r_match": 0,
+            "w_match": 0,
+            "l_match": 0,
+            "cnt": 0,
+        }
 
     for idx in idxs:
         spec = spec_arr[idx]
         best_pred = None
         best_mse = 1e9
+        best_ids = None
 
         for _c in range(max(1, n_candidates)):
-            ids = generate(model, spec, word_dict, max_len, device, greedy=greedy)
-            if len(ids) > max_len:
-                ids = ids[:max_len]
+            raw_ids = generate(model, spec, word_dict, max_len, device, greedy=greedy)
+            ids = raw_ids[:max_len]
             if len(ids) < max_len:
                 ids = ids + [pad_id] * (max_len - len(ids))
 
@@ -113,6 +173,7 @@ def eval_model(model, word_dict, spec_arr, surrogate, pad_id, n, max_len, greedy
             if mse < best_mse:
                 best_mse = mse
                 best_pred = pred
+                best_ids = raw_ids
 
         pred = best_pred
         mse = float(np.mean((pred - spec) ** 2))
@@ -123,6 +184,61 @@ def eval_model(model, word_dict, spec_arr, surrogate, pad_id, n, max_len, greedy
         mae_list.append(mae)
         corr_list.append(corr)
 
+        if use_diag:
+            pred_tokens = _trim_at_eos(_decode_pred(best_ids, index_dict))
+            gt_tokens = ["BOS"] + tk.decode(struct_list[idx]) + ["EOS"]
+
+            diag["cnt"] += 1
+            diag["pred_len"].append(len(pred_tokens))
+            diag["gt_len"].append(len(gt_tokens))
+            if "EOS" in pred_tokens:
+                diag["eos_hit"] += 1
+
+            # position match (exclude BOS/EOS positions)
+            pred_cmp = [t for t in pred_tokens if t not in ("BOS", "EOS")]
+            gt_cmp = [t for t in gt_tokens if t not in ("BOS", "EOS")]
+            L = min(len(pred_cmp), len(gt_cmp))
+            if L > 0:
+                match = sum(1 for i in range(L) if pred_cmp[i] == gt_cmp[i]) / float(L)
+                diag["pos_match"].append(match)
+
+            # field matches
+            if _extract_first("PX_", pred_tokens) == _extract_first("PX_", gt_tokens):
+                diag["px_match"] += 1
+            if _extract_first("PY_", pred_tokens) == _extract_first("PY_", gt_tokens):
+                diag["py_match"] += 1
+            if _extract_first("L1_H_", pred_tokens) == _extract_first("L1_H_", gt_tokens):
+                diag["h_match"] += 1
+            if _extract_first("L1_R_", pred_tokens) == _extract_first("L1_R_", gt_tokens):
+                diag["r_match"] += 1
+            if _extract_first("L1_W_", pred_tokens) == _extract_first("L1_W_", gt_tokens):
+                diag["w_match"] += 1
+            if _extract_first("L1_L_", pred_tokens) == _extract_first("L1_L_", gt_tokens):
+                diag["l_match"] += 1
+
+            if show_samples > 0 and diag["cnt"] <= show_samples:
+                print(f"[Sample {diag['cnt']-1}] idx={idx}")
+                print("  pred:", pred_tokens)
+                print("  gt  :", gt_tokens)
+
+    if use_diag and diag["cnt"] > 0:
+        avg_pred_len = float(np.mean(diag["pred_len"]))
+        avg_gt_len = float(np.mean(diag["gt_len"]))
+        eos_rate = diag["eos_hit"] / diag["cnt"]
+        pos_match = float(np.mean(diag["pos_match"])) if diag["pos_match"] else 0.0
+        print("Diagnostics:")
+        print(f"  avg_pred_len={avg_pred_len:.2f} avg_gt_len={avg_gt_len:.2f} eos_rate={eos_rate:.2%}")
+        print(f"  pos_match(excl BOS/EOS)={pos_match:.2%}")
+        print(
+            "  field_match: "
+            f"PX={diag['px_match']/diag['cnt']:.2%} "
+            f"PY={diag['py_match']/diag['cnt']:.2%} "
+            f"H={diag['h_match']/diag['cnt']:.2%} "
+            f"R={diag['r_match']/diag['cnt']:.2%} "
+            f"W={diag['w_match']/diag['cnt']:.2%} "
+            f"L={diag['l_match']/diag['cnt']:.2%}"
+        )
+
     return float(np.mean(mse_list)), float(np.mean(mae_list)), float(np.mean(corr_list))
 
 
@@ -131,14 +247,21 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--surrogate_ckpt", required=True)
     parser.add_argument("--spec_file", required=True)
+    parser.add_argument("--struct_file", default="")
+    parser.add_argument("--tokenizer", choices=["auto", "base", "extended"], default="auto")
     parser.add_argument("--n", type=int, default=50)
     parser.add_argument("--max_len", type=int, default=None)
     parser.add_argument("--greedy", action="store_true")
     parser.add_argument("--n_candidates", type=int, default=1)
+    parser.add_argument("--show_samples", type=int, default=0)
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     spec_arr = np.load(args.spec_file)
+    struct_list = None
+    if args.struct_file:
+        with open(args.struct_file, "rb") as f:
+            struct_list = pickle.load(f)
 
     model, word_dict, _, meta = load_stage12(args.ckpt, device)
 
@@ -153,7 +276,19 @@ if __name__ == "__main__":
     max_len = args.max_len if args.max_len is not None else s_meta.get("max_len", meta.get("max_len", 128))
 
     mse, mae, corr = eval_model(
-        model, word_dict, spec_arr, surrogate, pad_id, args.n, max_len, args.greedy, args.n_candidates
+        model,
+        word_dict,
+        index_dict,
+        spec_arr,
+        surrogate,
+        pad_id,
+        args.n,
+        max_len,
+        args.greedy,
+        args.n_candidates,
+        struct_list=struct_list,
+        tokenizer_mode=args.tokenizer,
+        show_samples=args.show_samples,
     )
 
     tag = "greedy" if args.greedy else "sample"
@@ -166,9 +301,11 @@ if __name__ == "__main__":
     print(f"Corr: {corr:.6f}")
 
 """
-python .\verify_stage12_surrogate.py ^
-  --ckpt .\ckpt_stage12_optogpt_real\stage12_best.pt ^
-  --surrogate_ckpt .\ckpt_forward_surrogate_real\surrogate_best.pt ^
-  --spec_file <你的spec.npy> ^
-  --n 50 --max_len 22 --greedy
+python verify_stage12_surrogate.py ^
+  --ckpt ./ckpt_stage12_optogpt_real/stage12_best.pt ^
+  --surrogate_ckpt ./ckpt_forward_surrogate_real/surrogate_best.pt ^
+  --spec_file improved_dataset/spec_train.npy ^
+  --struct_file improved_dataset/struct_train.pkl ^
+  --n 50 --max_len 9 --greedy --show_samples 3
+    --tokenizer extended
 """
