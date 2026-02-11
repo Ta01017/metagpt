@@ -125,10 +125,8 @@ class StructureTokenizerExtended(StructureTokenizer):
         print("🔧 扩展参数范围以适配实际数据...")
         
         # 扩展P范围：支持更小的周期
-        original_P_min = min(self.P_vals)
-        if original_P_min > 50:  # 如果最小P大于50nm，添加更小的值
-            self.P_vals = [50] + self.P_vals
-            print(f"  P范围扩展: 添加50nm")
+        self.P_vals = list(range(80, 451, 10))
+        print(f"  P range: {self.P_vals[0]}nm - {self.P_vals[-1]}nm, step=10nm")
         
         # 扩展R范围：支持更小的半径
         original_R_min = min(self.R_vals) 
