@@ -1,0 +1,18 @@
+# === Models / checkpoints ===
+ckpt_*/
+cache_*/
+**/*.pt
+**/*.pth
+**/*.ckpt
+
+# === Datasets ===
+dataset_*/
+**/*.npy
+**/*.npz
+**/*.pkl
+
+# === Logs / outputs ===
+*.log
+*.out
+*.err
+logs/
