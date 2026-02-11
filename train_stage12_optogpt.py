@@ -32,6 +32,22 @@ from core.models.transformer import make_model_I, subsequent_mask  # noqa: E402
 from core.trains.train import LabelSmoothing, NoamOpt, SimpleLossCompute, count_params  # noqa: E402
 
 
+def build_token_weights(seq_ids, vocab_size, pad_id, alpha=0.5, min_freq=1):
+    freq = np.zeros(vocab_size, dtype=np.float32)
+    for seq in seq_ids:
+        for t in seq:
+            if 0 <= t < vocab_size:
+                freq[t] += 1.0
+    freq = np.maximum(freq, float(min_freq))
+    weights = np.power(freq, -alpha)
+    weights[pad_id] = 0.0
+    # normalize to mean=1 (excluding pad)
+    non_pad = weights > 0
+    if np.any(non_pad):
+        weights = weights / np.mean(weights[non_pad])
+    return torch.tensor(weights, dtype=torch.float32)
+
+
 class Stage12Dataset(Dataset):
     def __init__(self, spec_arr, seq_list, max_len: int, pad_id: int, bos_id: int, eos_id: int):
         self.spec = spec_arr
@@ -247,7 +263,19 @@ def train():
 
     print("Model params:", count_params(model))
 
-    criterion = LabelSmoothing(len(word_dict), padding_idx=pad_id, smoothing=cfg.smoothing)
+    if cfg.token_reweight:
+        if cfg.smoothing > 0:
+            print("[Warn] token_reweight enabled -> smoothing=0.0 is recommended.")
+        weights = build_token_weights(
+            seq_ids,
+            vocab_size=len(word_dict),
+            pad_id=pad_id,
+            alpha=cfg.reweight_alpha,
+            min_freq=cfg.reweight_min_freq,
+        ).to(device)
+        criterion = torch.nn.NLLLoss(weight=weights, ignore_index=pad_id, reduction="sum")
+    else:
+        criterion = LabelSmoothing(len(word_dict), padding_idx=pad_id, smoothing=cfg.smoothing)
     optimizer = NoamOpt(
         cfg.d_model,
         cfg.max_lr,

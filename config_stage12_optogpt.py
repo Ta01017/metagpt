@@ -27,6 +27,11 @@ class TrainConfig:
     save_every: int = 0  # 0=disable periodic saves
     seed: int = 42
 
+    # ===== imbalance handling =====
+    token_reweight: bool = True
+    reweight_alpha: float = 0.5  # 0=off, 0.5~1.0 stronger
+    reweight_min_freq: int = 1
+
     # ===== spec type =====
     # 'R' / 'T' / 'R_T' (default keep full)
     spec_type: str = "R_T"
